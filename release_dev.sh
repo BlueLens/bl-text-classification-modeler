@@ -2,7 +2,7 @@
 
 export ORG="bluelens"
 export IMAGE="bl-text-classification-modeler"
-export TAG='prod'
+export TAG='dev'
 
 docker login
 
