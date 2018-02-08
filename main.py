@@ -8,20 +8,29 @@ from bluelens_log import Logging
 from bluelens_spawning_pool import spawning_pool
 from stylelens_dataset.texts import Texts
 from stylelens_product.products import Products
+from stylelens_product.models import Models
 import codecs
 
 from random import shuffle
 
 SPAWN_ID = os.environ['SPAWN_ID']
+RELEASE_MODE = os.environ['RELEASE_MODE']
+
 REDIS_SERVER = os.environ['REDIS_SERVER']
 REDIS_PASSWORD = os.environ['REDIS_PASSWORD']
-RELEASE_MODE = os.environ['RELEASE_MODE']
+REDIS_CRAWL_VERSION = 'bl:crawl:version'
+REDIS_CRAWL_VERSION_LATEST = 'latest'
+
 AWS_ACCESS_KEY = os.environ['AWS_ACCESS_KEY'].replace('"', '')
 AWS_SECRET_ACCESS_KEY = os.environ['AWS_SECRET_ACCESS_KEY'].replace('"', '')
 AWS_MODEL_BUCKET = 'bluelens-style-model'
 AWS_BUCKET_CLASSIFICATION_TEXT_PATH = 'classification/text/' + RELEASE_MODE + '/'
 
-REDIS_PRODUCT_TEXT_MODEL_PROCESS_QUEUE = 'bl:product:text:model:process:queue'
+def get_latest_crawl_version():
+  value = rconn.hget(REDIS_CRAWL_VERSION, REDIS_CRAWL_VERSION_LATEST)
+  return value
+
+# REDIS_PRODUCT_TEXT_MODEL_PROCESS_QUEUE = 'bl:product:text:model:process:queue'
 
 options = {
   'REDIS_SERVER': REDIS_SERVER,
@@ -34,6 +43,8 @@ storage = s3.S3(AWS_ACCESS_KEY, AWS_SECRET_ACCESS_KEY)
 
 text_api = Texts()
 product_api = Products()
+model_api = Models()
+PRODUCT_MODELS_TYPE = 'text-classification'
 
 TEXT_CLASSIFICATION_MODEL = 'text_classification_model'
 DATASET_LABEL_PREFIX = '__label__'
@@ -50,6 +61,19 @@ def delete_pod():
   spawn.setServerUrl(REDIS_SERVER)
   spawn.setServerPassword(REDIS_PASSWORD)
   spawn.delete(data)
+
+def save_eval_to_storage():
+  log.info('save_eval_to_storage')
+
+  eval_file_name = TEXT_CLASSIFICATION_MODEL + '.eval'
+
+  file = os.path.join(os.getcwd(), eval_file_name)
+  try:
+    return storage.upload_file_to_bucket(AWS_MODEL_BUCKET, file,
+                                         AWS_BUCKET_CLASSIFICATION_TEXT_PATH + eval_file_name)
+  except:
+    log.error('upload error')
+    return None
 
 def save_model_to_storage():
   log.info('save_text_model_to_s3_storage')
@@ -108,12 +132,12 @@ def convert_dataset_as_fasttext(text_code, datasets):
 
 def retrieve_products(text_code, keywords):
   for keyword in keywords:
-    keyword_data = keyword['text']
+    keyword_data = keyword.get('text')
     keyword_data.strip()
     if keyword_data == '':
       continue
-    print('retrieve_products_from_db_and_update() : ')
-    print(keyword['text'].encode('utf-8'))
+    log.info('retrieve_products_from_db_and_update() : ')
+    log.info(keyword.get('text').encode('utf-8'))
     dataset = retrieve_products_from_db_and_update(keyword_data)
 
     # print(str(text_code) + ' : ' + keyword_data + ' / ')
@@ -121,21 +145,30 @@ def retrieve_products(text_code, keywords):
     convert_dataset_as_fasttext(text_code, dataset)
 
 def retrieve_products_from_db_and_update(keyword):
-  offset = 0
-  limit = 100
-
   datasets = []
   while True:
     products = product_api.get_products_by_keyword(keyword,
-                                                   only_text=True,
-                                                   is_processed_for_text_class_model=True,
-                                                   offset=offset, limit=limit)
+                                                   only_text=True, is_processed_for_text_class_model=False)
+
+    if 0 == len(products):
+      break
 
     for product in products:
       data = []
-      data.append(product['name'])
-      # data.extend(product['tags'])
-      data.extend(product['cate'])
+
+      name = product.get('name')
+      cate = product.get('cate')
+      tags = product.get('tags')
+
+      # print('name: {name} / cate: {cate} / tags: {tags}'.format(**product))
+
+      if name is not None:
+        data.append(name)
+      if cate is not None:
+        data.extend(cate)
+      # if tags is not None:
+      #   data.extend(tags)
+
       data = list(set(data))
 
       datasets.append(data)
@@ -143,11 +176,6 @@ def retrieve_products_from_db_and_update(keyword):
       product['is_processed_for_text_class_model'] = True
 
     product_api.update_products(products)
-
-    if limit > len(products):
-      break
-    else:
-      offset = offset + limit
 
   return datasets
 
@@ -170,7 +198,7 @@ def make_dataset():
   i = 0
   # datasets for evaluation
   try:
-    f = codecs.open('text_classification_model.eval', 'w', 'utf-8')
+    f = codecs.open(TEXT_CLASSIFICATION_MODEL + '_temp.eval', 'w', 'utf-8')
     for i in range(0, eval_data_count):
       f.write(generated_datasets[i] + '\n')
   except IOError:
@@ -181,7 +209,7 @@ def make_dataset():
   i = 0
   # datasets for training
   try:
-    f = codecs.open('text_classification_model.train', 'w', 'utf-8')
+    f = codecs.open(TEXT_CLASSIFICATION_MODEL + '_temp.train', 'w', 'utf-8')
     for i in range(eval_data_count, datasets_total):
       f.write(generated_datasets[i] + '\n')
   except IOError:
@@ -189,7 +217,16 @@ def make_dataset():
   finally:
     f.close()
 
-  print('Generating dataset Done !!')
+  log.info('temp dataset generated')
+
+  os.system('cat ' + TEXT_CLASSIFICATION_MODEL + '_temp.eval '
+                                                 '| sed -e "s/\([.\[\!?,^\'~+&*@#$%=/{}\\"()]\)/ /g" '
+                                                 '| tr "[:upper:]" "[:lower:]" > ' + TEXT_CLASSIFICATION_MODEL + '.eval')
+  os.system('cat ' + TEXT_CLASSIFICATION_MODEL + '_temp.train '
+                                                 '| sed -e "s/\([.\[\!?,^\'~+&*@#$%=/{}\\"()]\)/ /g" '
+                                                 '| tr "[:upper:]" "[:lower:]" > ' + TEXT_CLASSIFICATION_MODEL + '.train')
+  log.info('dataset normalized !')
+
 
 def print_model_results(result):
     print("Number of examples for test: " + str(result.nexamples))
@@ -229,8 +266,15 @@ def predict_test():
                 '스틱 실버 귀걸이',
                 '항공점퍼랑 패딩이랑 (양면패딩)',
                ]
+  normalized_test_data = []
 
-  results = model.predict_proba(test_data)
+  for data in test_data:
+    normalized = re.sub('[^가-힝A-Za-z0-9]+', ' ', data)
+    lower = normalized.lower()
+
+    normalized_test_data.append(lower)
+
+  results = model.predict_proba(normalized_test_data)
   print_results(results)
 """"""""
 # predict test ends.
@@ -238,14 +282,28 @@ def predict_test():
 
 def start():
   try:
+    version_id = get_latest_crawl_version()
+    # doing
+    model = {
+      'status': 'doing'
+    }
+    model_api.update_model(PRODUCT_MODELS_TYPE, version_id, model)
+    log.info('Doing : bl-text-classification-modeler')
+
     make_dataset()
     make_model()
     save_model_to_storage()
+    save_eval_to_storage()
 
     predict_test()
 
-    if (rconn.blpop([REDIS_PRODUCT_TEXT_MODEL_PROCESS_QUEUE])):
-      log.info('SUCCESS : bl-text-classification-modeler')
+    # done
+    model['status'] = 'done'
+    model_api.update_model(PRODUCT_MODELS_TYPE, version_id, model)
+    log.info('Done : bl-text-classification-modeler')
+
+    # if (rconn.blpop([REDIS_PRODUCT_TEXT_MODEL_PROCESS_QUEUE])):
+    #   log.info('SUCCESS : bl-text-classification-modeler')
 
   except Exception as e:
     log.error(str(e))
@@ -256,4 +314,4 @@ if __name__ == '__main__':
     start()
   except Exception as e:
     log.error('main; ' + str(e))
-    delete_pod()
+    # delete_pod()
